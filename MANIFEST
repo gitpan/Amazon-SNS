@@ -1,0 +1,6 @@
+MANIFEST
+AUTHORS
+ChangeLog
+lib/Amazon/SNS.pm
+Makefile.PL
+META.yml                                 Module meta-data (added by MakeMaker)
