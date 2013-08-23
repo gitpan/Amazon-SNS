@@ -9,9 +9,10 @@ __PACKAGE__->mk_accessors(qw/ key secret error service debug /);
 
 use LWP::UserAgent;
 use XML::Simple;
-use Net::Amazon::AWSSign;
+use URI::Escape;
+use Digest::SHA qw(hmac_sha256_base64);
 
-our $VERSION = '1.0';
+our $VERSION = '1.2';
 
 
 sub CreateTopic
@@ -76,17 +77,33 @@ sub dispatch
 	$self->service('http://sns.eu-west-1.amazonaws.com')
 		unless defined $self->service;
 
+	# sanitize args
+	do { delete $args->{$_} unless defined $args->{$_} } for (keys %$args);
+
+	# add signature elements
+	$args->{'Timestamp'} = $self->timestamp;
+	$args->{'AWSAccessKeyId'} = $self->key;
+	$args->{'SignatureVersion'} = 2;
+	$args->{'SignatureMethod'} = 'HmacSHA256';
+
 	# build URI
-	my $uri = $self->service . '/?'
-		. join('&', map { $_ . '=' . $args->{$_} } keys %$args );
+	my $uri = URI->new($self->service);
 
-	# sign
-	$uri = Net::Amazon::AWSSign
-			->new($self->key, $self->secret)
-			->addRESTSecret($uri);
+	$uri->path('/');
+	$uri->query(join('&', map { $_ . '=' . URI::Escape::uri_escape_utf8($args->{$_}, '^A-Za-z0-9\-_.~') } sort keys %$args ));
 
-	# send
-	my $response = LWP::UserAgent->new->get($uri);
+	# create signature
+	$args->{'Signature'} = hmac_sha256_base64(join("\n", 'POST', $uri->host, $uri->path, $uri->query), $self->secret);
+
+	# padding
+	while (length($args->{'Signature'}) % 4) {
+		$args->{'Signature'} .= '=';
+	}
+
+	# rewrite query string
+	$uri->query(join('&', map { $_ . '=' . URI::Escape::uri_escape_utf8($args->{$_}, '^A-Za-z0-9\-_.~') } sort keys %$args ));
+
+	my $response = LWP::UserAgent->new->post($self->service, 'Content' => $uri->query);
 
         if ($response->is_success) {
 		return XMLin($response->content,
@@ -95,7 +112,7 @@ sub dispatch
 				'ForceArray' => [ qw/ Topics member / ],
 		);
         } else {
-		#print $response->content, "\n";
+		print $response->content, "\n";
 		$self->error(
 			($response->content =~ /^<.+>/)
 				? eval { XMLin($response->content)->{'Error'}{'Message'} || $response->status_line }
@@ -109,6 +126,14 @@ sub dispatch
 	return undef;
 }
 
+sub timestamp {
+
+	return sprintf("%04d-%02d-%02dT%02d:%02d:%02d.000Z", sub {
+		($_[5]+1900, $_[4]+1, $_[3], $_[2], $_[1], $_[0])
+	}->(gmtime(time)));
+}
+
+
 1;
 
 package Amazon::SNS::Topic;
@@ -118,6 +143,8 @@ use warnings;
 
 use base qw(Class::Accessor);
 
+use JSON;
+
 __PACKAGE__->mk_accessors(qw/ sns arn /);
 
 sub Publish
@@ -126,13 +153,23 @@ sub Publish
 
 	# XXX croak on invalid arn
 
-	my $r = $self->sns->dispatch({
-		'Action'	=> 'Publish',
-		'TopicArn'	=> $self->arn,
-		'Message'	=> $msg,
-	});
+	my $structure = undef;
 
-	# XXX add subj support
+	# support JSON payload
+	if (ref($msg) eq 'HASH') {
+
+		$structure = 'json';
+		$msg = encode_json($msg);
+	}
+
+
+	my $r = $self->sns->dispatch({
+		'Action'		=> 'Publish',
+		'TopicArn'		=> $self->arn,
+		'Message'		=> $msg,
+		'MessageStructure'	=> $structure,
+		'Subject'		=> $subj,
+	});
 
 	# return message id on success, undef on error
 	return $r ? $r->{'PublishResult'}{'MessageId'} : undef;
@@ -155,7 +192,7 @@ Amazon::SNS - Amazon Simple Notification Service made simpler
 
   use Amazon::SNS;
 
-  my $sns = Amazon::SNS->new('key' => '...', 'secret' => '...');
+  my $sns = Amazon::SNS->new({ 'key' => '...', 'secret' => '...' });
 
 
   # create a new topic and publish
@@ -198,7 +235,7 @@ Sorry for not providing a better documentation, patches are always accepted. ;)
 
 =over
 
-=item Amazon::SNS->new('key' => '...', 'secret' => '...')
+=item Amazon::SNS->new({ 'key' => '...', 'secret' => '...' })
 
 	Creates an Amazon::SNS object with given key and secret.
 
